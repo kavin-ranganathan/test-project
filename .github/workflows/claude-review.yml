@@ -1,4 +1,5 @@
 name: Claude Code Review
+
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -11,40 +12,233 @@ jobs:
   review:
     if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get PR diff
-        id: diff
+      - name: Get PR diff and metadata
         run: |
           git diff origin/${{ github.base_ref }}...HEAD > pr_diff.txt
-          echo "diff_size=$(wc -c < pr_diff.txt)" >> $GITHUB_OUTPUT
+          echo "Diff size: $(wc -c < pr_diff.txt) bytes"
+          echo "Files changed: $(git diff origin/${{ github.base_ref }}...HEAD --name-only | wc -l)"
+          git diff origin/${{ github.base_ref }}...HEAD --name-only > changed_files.txt
+          cat changed_files.txt
 
-      - name: Run Claude Review via OpenRouter
+      - name: Truncate diff if too large
+        run: |
+          MAX_BYTES=80000
+          if [ $(wc -c < pr_diff.txt) -gt $MAX_BYTES ]; then
+            echo "Diff too large, truncating to ${MAX_BYTES} bytes..."
+            head -c $MAX_BYTES pr_diff.txt > pr_diff_truncated.txt
+            printf "\n\n[DIFF TRUNCATED — showing first %d bytes only. Review remaining files manually.]\n" $MAX_BYTES >> pr_diff_truncated.txt
+            mv pr_diff_truncated.txt pr_diff.txt
+          fi
+
+      - name: Build request payload
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_BRANCH: ${{ github.base_ref }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+
+          diff         = open("pr_diff.txt", "r", errors="replace").read()
+          changed_files = open("changed_files.txt", "r").read().strip()
+
+          pr_title  = os.environ.get("PR_TITLE", "")
+          pr_body   = os.environ.get("PR_BODY", "") or "No description provided."
+          pr_author = os.environ.get("PR_AUTHOR", "")
+          base      = os.environ.get("BASE_BRANCH", "main")
+          head      = os.environ.get("HEAD_BRANCH", "")
+
+          prompt = f"""You are a senior software engineer conducting a thorough code review. Be direct, specific, and genuinely helpful — like a senior teammate who cares about code quality.
+
+## PR Context
+- **Title:** {pr_title}
+- **Author:** {pr_author}
+- **Branch:** {head} → {base}
+- **Description:** {pr_body}
+- **Files changed:**
+{changed_files}
+
+## Diff
+```diff
+{diff}
+```
+
+---
+
+## Your Review
+
+Produce a structured review covering every section below. For each issue found, include:
+- The exact file path and line number(s)
+- What the problem is
+- Why it matters
+- A concrete fix or recommendation
+
+---
+
+### 1. 🐛 Bugs & Logic Errors
+Look for:
+- Off-by-one errors, incorrect conditionals, wrong operator usage
+- Null/undefined/None dereferences that will crash at runtime
+- Race conditions or concurrency issues
+- Incorrect error handling (swallowed exceptions, wrong error types)
+- Edge cases not handled (empty arrays, zero values, very large inputs)
+- Incorrect assumptions about external API responses or data shapes
+- State mutations that shouldn't happen
+- Functions that don't do what their name suggests
+
+### 2. 🔒 Security Vulnerabilities
+Look for:
+- Injection risks (SQL, NoSQL, command injection, XSS, template injection)
+- Authentication or authorisation bypasses
+- Hardcoded secrets, API keys, passwords, tokens
+- Sensitive data logged or exposed in error messages
+- Insecure direct object references (IDOR)
+- Missing input validation or sanitisation
+- Unsafe deserialisation
+- Broken access control
+- CSRF vulnerabilities in state-changing endpoints
+- Insecure dependencies or imports
+
+### 3. ⚡ Performance Issues
+Look for:
+- N+1 database queries (queries inside loops)
+- Missing database indexes for new query patterns
+- Unnecessary re-renders or recomputations (frontend)
+- Blocking synchronous I/O in async contexts
+- Large payloads being loaded into memory unnecessarily
+- Missing pagination on endpoints that return lists
+- Expensive operations in hot paths (called frequently)
+- Missing caching where it would obviously help
+
+### 4. 🏗️ Code Quality & Best Practices
+Look for:
+- Functions doing too many things (violating single responsibility)
+- Deep nesting that makes code hard to follow
+- Magic numbers or strings that should be named constants
+- Code duplication that should be extracted
+- Dead code or commented-out code left in
+- Variable or function names that are unclear or misleading
+- Missing or inadequate error messages (unhelpful to debug)
+- Overly complex logic that could be simplified
+- Violations of existing patterns in the codebase
+
+### 5. 🧪 Testing Gaps
+Look for:
+- New functions or methods with no tests
+- Edge cases not covered by existing or new tests
+- Happy path only — missing error/failure case tests
+- Tests that test implementation rather than behaviour
+- Missing integration tests for new API endpoints
+- Hard-coded test data that should be parameterised
+
+### 6. 📖 Maintainability & Documentation
+Look for:
+- Public functions/methods/APIs with no docstring or comment
+- Complex algorithms with no explanation of the approach
+- Missing README updates for new features or config changes
+- Misleading or outdated comments
+- Breaking changes with no migration notes
+
+### 7. 💡 Suggestions (Non-blocking)
+Any improvements that are worth considering but not critical. Label these clearly as optional.
+
+---
+
+### Summary
+
+End with a brief summary:
+- **Verdict:** one of: Approve / Request Changes / Needs significant rework
+- **Critical issues found:** (count)
+- **Top 3 things to fix before merging** (if any)
+
+---
+
+Be honest. If the code is solid, say so. Do not manufacture feedback.
+If something is genuinely well done, call it out.
+Do NOT flag things that are purely style or formatting if a linter would catch them.
+"""
+
+          payload = {
+              "model": "anthropic/claude-sonnet-4-6",
+              "max_tokens": 8192,
+              "messages": [{"role": "user", "content": prompt}]
+          }
+
+          with open("payload.json", "w") as f:
+              json.dump(payload, f)
+
+          print(f"Payload built: {len(json.dumps(payload))} bytes")
+          PYEOF
+
+      - name: Call OpenRouter API
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
         run: |
-          DIFF=$(cat pr_diff.txt)
-
-          RESPONSE=$(curl -s https://openrouter.ai/api/v1/chat/completions \
+          curl -s https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer $OPENROUTER_API_KEY" \
             -H "Content-Type: application/json" \
-            -d '{
-              "model": "anthropic/claude-sonnet-4-6",
-              "messages": [{
-                "role": "user",
-                "content": "Review this PR diff. Focus on bugs, security issues, performance, missing tests. Be specific with file paths and line numbers. Skip nitpicks.\n\n'"$DIFF"'"
-              }]
-            }')
+            -H "HTTP-Referer: https://github.com/${{ github.repository }}" \
+            -H "X-Title: Claude PR Review Bot" \
+            --data @payload.json \
+            -o response.json
 
-          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
+          if jq -e '.error' response.json > /dev/null 2>&1; then
+            echo "API Error:"
+            jq '.error' response.json
+            exit 1
+          fi
 
-          # Post as PR comment
-          gh api repos/$REPO/issues/$PR_NUMBER/comments \
-            -f body="## Claude Code Review\n\n$REVIEW"
+          jq -r '.choices[0].message.content' response.json > review.txt
+
+          echo "Token usage:"
+          jq '.usage' response.json
+          echo "Review length: $(wc -w < review.txt) words"
+
+      - name: Post review comment on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: |
+          python3 - <<'PYEOF'
+          import subprocess, os, json
+
+          review     = open("review.txt", "r").read()
+          repo       = os.environ["GITHUB_REPOSITORY"]
+          pr_number  = os.environ["PR_NUMBER"]
+          run_id     = os.environ["GITHUB_RUN_ID"]
+          server_url = os.environ["GITHUB_SERVER_URL"]
+
+          body = f"""## 🤖 Claude Code Review
+
+{review}
+
+---
+*Powered by Claude Sonnet via OpenRouter · [View run]({server_url}/{repo}/actions/runs/{run_id})*"""
+
+          payload = json.dumps({"body": body})
+
+          result = subprocess.run([
+              "gh", "api",
+              f"repos/{repo}/issues/{pr_number}/comments",
+              "-H", "Accept: application/vnd.github+json",
+              "--input", "-"
+          ], input=payload, text=True, capture_output=True)
+
+          if result.returncode != 0:
+              print("Failed to post comment:")
+              print(result.stderr)
+              exit(1)
+
+          print("Review posted successfully")
+          PYEOF

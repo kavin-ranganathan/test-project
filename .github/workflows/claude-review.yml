@@ -1,0 +1,43 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Skip drafts and dependabot to save tokens
+    if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: claude-sonnet-4-6
+          prompt: |
+            You are reviewing this pull request. Follow CLAUDE.md if present.
+
+            Focus on:
+            - Bugs, logic errors, edge cases
+            - Security issues (injection, auth, secrets, unsafe deserialization)
+            - Performance concerns (N+1 queries, blocking I/O, memory leaks)
+            - Missing tests or error handling
+            - Style and consistency with the existing codebase
+
+            Be specific. Always reference file paths and line numbers.
+            Skip nitpicks. Don't repeat what linters already catch.
+            If the PR is good, say so briefly — don't manufacture feedback.

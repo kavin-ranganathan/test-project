@@ -1,5 +1,4 @@
 name: Claude Code Review
-
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -7,16 +6,9 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  issues: write
-  id-token: write
-
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
 
 jobs:
   review:
-    # Skip drafts and dependabot to save tokens
     if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -25,20 +17,34 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          model: claude-sonnet-4-6
-          prompt: |
-            You are reviewing this pull request. Follow CLAUDE.md if present.
+      - name: Get PR diff
+        id: diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > pr_diff.txt
+          echo "diff_size=$(wc -c < pr_diff.txt)" >> $GITHUB_OUTPUT
 
-            Focus on:
-            - Bugs, logic errors, edge cases
-            - Security issues (injection, auth, secrets, unsafe deserialization)
-            - Performance concerns (N+1 queries, blocking I/O, memory leaks)
-            - Missing tests or error handling
-            - Style and consistency with the existing codebase
+      - name: Run Claude Review via OpenRouter
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          DIFF=$(cat pr_diff.txt)
 
-            Be specific. Always reference file paths and line numbers.
-            Skip nitpicks. Don't repeat what linters already catch.
-            If the PR is good, say so briefly — don't manufacture feedback.
+          RESPONSE=$(curl -s https://openrouter.ai/api/v1/chat/completions \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "anthropic/claude-sonnet-4-6",
+              "messages": [{
+                "role": "user",
+                "content": "Review this PR diff. Focus on bugs, security issues, performance, missing tests. Be specific with file paths and line numbers. Skip nitpicks.\n\n'"$DIFF"'"
+              }]
+            }')
+
+          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
+
+          # Post as PR comment
+          gh api repos/$REPO/issues/$PR_NUMBER/comments \
+            -f body="## Claude Code Review\n\n$REVIEW"
